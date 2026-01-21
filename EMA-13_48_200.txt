@@ -1,0 +1,178 @@
+//@version=6
+strategy("",  overlay=true, initial_capital=10000,  default_qty_type=strategy.percent_of_equity, default_qty_value=100)
+
+//----Inputs
+useTrail      = input.bool(true, "Use ATR trailing stop")
+atrLen        = input.int(7, "ATR Length (7-12 for 2min)", minval=5)
+atrSL         = input.float(3, "ATR × Stop", step=0.1)
+atrTP         = input.float(1, "ATR × Target", step=0.1)
+//qty           = input.int(1, "No of contracts", minval=1)
+
+show_premarket_high = input.bool(true, "Pre Market High", group="configuration")
+show_premarket_low = input.bool(true, "Pre Market Low", group="configuration")
+show_labels = input.bool(true, "Show Label", group="configuration")
+
+
+// ---------------------------------------------------------
+// 🔹 Regular Trading Hours Filter (9:30–16:00) Pre Market: 4:00 AM - 9:30 AM ET
+// ---------------------------------------------------------
+premarket_session = "0400-0930"
+regular_session = "0930-1600"
+
+inRTH = not na(time(timeframe.period, regular_session)) 
+is_premarket = not na(time(timeframe.period, premarket_session, "America/New_York"))
+
+// === VARIABLES ===
+var float pm_high = na
+var float pm_low = na
+var int pm_start_time = na
+var bool new_day = false
+var int eod_time = na
+
+// ---------------------------------------------------------
+// 🔹 Pre Market High / Low
+// ---------------------------------------------------------
+// Detect new trading day
+new_day := ta.change(dayofweek) != 0
+if new_day
+    pm_high := na
+    pm_low := na
+    pm_start_time := na
+
+first_pm_bar = is_premarket and not is_premarket[1]
+
+if first_pm_bar
+    pm_high := high
+    pm_low := low
+    pm_start_time := time
+
+if is_premarket and not na(pm_high)
+    pm_high := math.max(pm_high, high)
+    pm_low := math.min(pm_low, low)
+
+first_regular_bar = inRTH and not inRTH[1]
+//timestamp("America/New_York", current_hour, current_minute)
+//var label timeLabel = na
+
+//if barstate.islast
+  //  label.delete(timeLabel)
+  //  timeLabel := label.new( bar_index, na, "Now: " + str.format("{0,date,yyyy-MM-dd HH:mm:ss}", timenow), xloc = xloc.bar_index, yloc = yloc.price, style = label.style_label_left, textcolor = color.white   )
+
+
+if first_regular_bar
+    // Calculate the EOD time (16:00 ET) on the current day
+    eod_time := timestamp("America/New_York", year, month, dayofmonth, 16, 0)
+
+
+if first_regular_bar and not na(pm_high) and not na(pm_low)
+    if show_premarket_high
+        line.new(x1=pm_start_time, y1=pm_high, x2=eod_time, y2=pm_high, color=color.new(#00A3B3, 10), width=2, style=line.style_dashed,xloc=xloc.bar_time)
+        //line.new(x1=pm_start_time, y1=pm_high, x2=timenow + 60 * 60 * 1000, y2=pm_high, color=color.new(#00A3B3, 0), width=1, style=line.style_dashed,xloc=xloc.bar_time)
+        label.new(x=eod_time, y=pm_high,text="PMH",style=label.style_label_left,color=color.new(color.blue,10),textcolor=color.white,xloc=xloc.bar_time)
+    
+    if show_premarket_low
+        line.new(x1=pm_start_time, y1=pm_low, x2=eod_time, y2=pm_low, color=color.new(#CC3D00, 10), width=2, style=line.style_dashed,xloc=xloc.bar_time)
+        //label.new(x=eod_time, y=pm_low,text="PML",style=label.style_label_left,color=color.new(color.blue,10),textcolor=color.white,xloc=xloc.bar_time)
+        label.new(x=eod_time, y=pm_low,text="PML",style=label.style_label_left,color=color.new(color.blue,10),textcolor=color.white,xloc=xloc.bar_time)
+        
+    
+
+// ---------------------------------------------------------
+// 🔹 Previous Day High / Low
+// ---------------------------------------------------------
+prevDayLow  = request.security(syminfo.tickerid, "D", low[1],  lookahead=barmerge.lookahead_on)
+prevDayHigh = request.security(syminfo.tickerid, "D", high[1], lookahead=barmerge.lookahead_on)
+
+//plot(prevDayLow,  "Previous Day Low",  color=color.new(color.green, 0), linewidth=2)
+//plot(prevDayHigh, "Previous Day High", color=color.new(color.red, 0), linewidth=2)
+
+//plot(prevDayLow,  "Previous Day Low",  color=color.new(#FF470F, 0), linewidth=2)
+plot(prevDayLow,  "Previous Day Low",  color=color.new(#FF470F, 0), linewidth=2)
+plot(prevDayHigh, "Previous Day High", color=color.new(color.blue, 0), linewidth=2)
+
+// ---------------------------------------------------------
+// 🔹 EMAs
+// ---------------------------------------------------------
+ema13  = ta.ema(close, 13)
+ema48  = ta.ema(close, 48)
+ema200 = ta.ema(close, 200)
+
+plot(ema13,"EMA 13", color=color.orange, linewidth=2)
+plot(ema48,"EMA 48",  color=color.purple, linewidth=1)
+plot(ema200,"EMA 200",  color=color.red, linewidth=1)
+
+
+// ── ATR & Risk Management ─────────────────────
+atr = ta.atr(atrLen)
+stopDist  =  atr * atrSL *100
+takeprofit = atr * atrTP *100
+
+trailActivationLong  = close - stopDist
+trailActivationShort = close + stopDist
+
+// ── Trend ─────────────────────────────────────
+
+bearTrend = ema13 < ema48 and ema48 < ema200
+bullTrend = ema13 > ema48 and ema48 > ema200
+
+redcandle = close < open
+greencandle = close > open
+
+prevcandlered = close[1] < open[1]
+prevcandlegreen = close[1] > open[1]
+
+priceCrossBelow13 = ta.crossunder(close, ema13)
+priceCrossAbove13 = ta.crossover(close, ema13)
+
+pricebelow13 = close < ema13 
+priceAboveEMA13 = close > ema13 
+priceAboveEMA200 = close > ema200
+
+bullTrend01 = (ema13 > ema48) and (ema13 > ema200) and priceAboveEMA13 //and priceAboveEMA200 
+one =1
+
+//Entry Conditions
+short_cond01 = priceCrossBelow13 and bearTrend and ema13 < ema13[1] 
+short_cond02 = pricebelow13 and ema13 < ema48 and prevcandlegreen and ema13 < ema13[1] and 1 > 2
+short_cond03 = bearTrend and close > ema13 and ema13 < ema13[1]
+
+enterShort = inRTH and (short_cond01 or short_cond02 or short_cond03) 
+
+
+long_cond01 = priceCrossAbove13 and bullTrend  and ema13 > ema13[1]
+long_cond02 = bullTrend01 and redcandle[1] and greencandle and ema13 > ema13[1]
+long_cond03 = bullTrend01 and open -.5 < ema13 and greencandle and ema13 > ema13[1]
+
+enterLong = inRTH  and (long_cond01 or long_cond02 or long_cond03)
+
+// ------Entries + Exits --------------------------------------
+if enterShort and strategy.position_size == 0
+    strategy.entry("Short", strategy.short)
+    strategy.exit("SX", "Short", stop=close + stopDist, trail_price = useTrail ? trailActivationShort : na, trail_offset = useTrail ? stopDist : na)
+
+// ── Additional Smart Exits 
+if strategy.position_size < 0 and (ta.crossover(close, ema13 + .25) or ema13 > ema48 )//or close > open[1] )//or close > highest5)
+    strategy.close("Short")
+
+if enterLong and strategy.position_size == 0
+    strategy.entry("Long", strategy.long)
+    strategy.exit("LX", "Long", stop=close - stopDist, trail_price = useTrail ? trailActivationLong : na, trail_offset = useTrail ? stopDist : na)  
+
+// ── Additional Smart Exits ────────────────────
+if strategy.position_size > 0 and (ta.crossunder(close, ema13 -.25) or ema13 < ema48 )//or close < open[1])
+    strategy.close("Long")
+
+
+// ── End of Day Flat ───────────────────────────
+eod = time >= timestamp(syminfo.timezone, year, month, dayofmonth, 15, 59)
+if eod and strategy.position_size != 0
+    strategy.close_all("EOD")
+
+
+// --- Detect Strategy Entries ---
+longEntry  = strategy.position_size > 0 and strategy.position_size[1] <= 0
+shortEntry = strategy.position_size < 0 and strategy.position_size[1] >= 0
+
+// --- Alerts ---
+alertcondition(longEntry,  title="Long Entry",  message="Strategy entered LONG")
+alertcondition(shortEntry, title="Short Entry", message="Strategy entered SHORT")
