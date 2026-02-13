@@ -1,0 +1,493 @@
+//@version=6
+strategy("EMA-", 
+     overlay=true, 
+     initial_capital=10000, 
+     default_qty_type=strategy.percent_of_equity, 
+     default_qty_value=100,
+     commission_type=strategy.commission.cash_per_contract,
+     commission_value=0.65)
+//version history
+//
+//11-Feb-2026 : removed limit as its creating shorter gain trades
+// ========================================
+// 📊 INPUT PARAMETERS
+// ========================================
+
+// === Risk Management ===
+useTrail      = input.bool(false, "Use ATR Trailing Stop", group="Risk Management")
+atrLen        = input.int(7, "A                                                                                           TR Length", minval=5, group="Risk Management")
+atrSL         = input.float(3.0, "ATR × Stop Loss", step=0.1, group="Risk Management")
+atrTP         = input.float(6, "ATR × Take Profit", step=0.1, group="Risk Management")
+riskRewardRatio = input.float(1.5, "Risk:Reward Ratio", minval=0.5, step=0.1, group="Risk Management")
+
+// === EMA Settings ===
+ema_fast_length = input.int(13, "Fast EMA", minval=1, group="EMA Settings")
+ema_mid_length = input.int(48, "Mid EMA", minval=1, group="EMA Settings")
+ema_slow_length = input.int(200, "Slow EMA", minval=1, group="EMA Settings")
+
+// === MACD Settings ===
+use_macd = input.bool(true, "Use MACD Filter", group="MACD Settings")
+macd_fast = input.int(12, "MACD Fast", minval=1, group="MACD Settings")
+macd_slow = input.int(26, "MACD Slow", minval=1, group="MACD Settings")
+macd_signal = input.int(9, "MACD Signal", minval=1, group="MACD Settings")
+
+// === RSI Settings ===
+use_rsi = input.bool(true, "Use RSI Filter", group="RSI Settings")
+rsi_length = input.int(14, "RSI Length", minval=1, group="RSI Settings")
+rsi_overbought = input.int(90, "RSI Overbought", minval=50, maxval=100, group="RSI Settings")
+rsi_oversold = input.int(10, "RSI Oversold", minval=0, maxval=50, group="RSI Settings")
+
+// === Display Options ===
+show_premarket_high = input.bool(true, "Pre-Market High", group="Display")
+show_premarket_low = input.bool(true, "Pre-Market Low", group="Display")
+show_prev_day = input.bool(true, "Previous Day High/Low", group="Display")
+show_labels = input.bool(true, "Show Entry/Exit Labels", group="Display")
+show_ema = input.bool(true, "Show EMAs", group="Display")
+show_info_table = input.bool(true, "Show Info Table", group="Display")
+
+// === Session Filters ===
+trade_in_premarket = input.bool(false, "Trade Pre-Market", group="Session")
+eod_close_time = input.int(15, "EOD Close Hour (ET)", minval=14, maxval=16, group="Session")
+eod_close_minute = input.int(59, "EOD Close Minute", minval=0, maxval=59, group="Session")
+
+// ========================================
+// 🕐 SESSION FILTERS
+// ========================================
+
+premarket_session = "0400-0930"
+regular_session = "0930-1600"
+
+inRTH = not na(time(timeframe.period, regular_session, "America/New_York"))
+is_premarket = not na(time(timeframe.period, premarket_session, "America/New_York"))
+
+// Determine if we should trade
+inTradingSession = trade_in_premarket ? (inRTH or is_premarket) : inRTH
+
+// ========================================
+// 📈 PRE-MARKET HIGH/LOW TRACKING
+// ========================================
+
+var float pm_high = na
+var float pm_low = na
+var int pm_start_time = na
+var bool new_day = false
+var int eod_time = na
+
+// Detect new trading day
+new_day := ta.change(dayofweek) != 0
+if new_day
+    pm_high := na
+    pm_low := na
+    pm_start_time := na
+
+first_pm_bar = is_premarket and not is_premarket[1]
+
+if first_pm_bar
+    pm_high := high
+    pm_low := low
+    pm_start_time := time
+
+if is_premarket and not na(pm_high)
+    pm_high := math.max(pm_high, high)
+    pm_low := math.min(pm_low, low)
+
+first_regular_bar = inRTH and not inRTH[1]
+
+if first_regular_bar
+    eod_time := timestamp("America/New_York", year, month, dayofmonth, 16, 0)
+
+// Plot Pre-Market Levels
+if first_regular_bar and not na(pm_high) and not na(pm_low)
+    if show_premarket_high
+        line.new(x1=pm_start_time, y1=pm_high, x2=eod_time, y2=pm_high, 
+             color=color.new(#00A3B3, 10), width=2, style=line.style_dashed, xloc=xloc.bar_time)
+        label.new(x=eod_time, y=pm_high, text="PMH", style=label.style_label_left, 
+             color=color.new(color.blue, 10), textcolor=color.white, xloc=xloc.bar_time)
+    
+    if show_premarket_low
+        line.new(x1=pm_start_time, y1=pm_low, x2=eod_time, y2=pm_low, 
+             color=color.new(#CC3D00, 10), width=2, style=line.style_dashed, xloc=xloc.bar_time)
+        label.new(x=eod_time, y=pm_low, text="PML", style=label.style_label_left, 
+             color=color.new(color.blue, 10), textcolor=color.white, xloc=xloc.bar_time)
+
+// ========================================
+// 📊 PREVIOUS DAY HIGH/LOW
+// ========================================
+
+prevDayLow  = request.security(syminfo.tickerid, "D", low[1], lookahead=barmerge.lookahead_on)
+prevDayHigh = request.security(syminfo.tickerid, "D", high[1], lookahead=barmerge.lookahead_on)
+
+//if show_prev_day
+plot(prevDayLow, "Prev Day Low", color=color.new(#FF470F, 0), linewidth=2)
+plot(prevDayHigh, "Prev Day High", color=color.new(color.blue, 0), linewidth=2)
+
+// ========================================
+// 📉 CALCULATE INDICATORS
+// ========================================
+
+// EMAs
+ema_13 = ta.ema(close, ema_fast_length)
+ema_48 = ta.ema(close, ema_mid_length)
+ema_200 = ta.ema(close, ema_slow_length)
+
+// MACD
+[macd_line, signal_line, histogram] = ta.macd(close, macd_fast, macd_slow, macd_signal)
+
+// RSI
+rsi = ta.rsi(close, rsi_length)
+
+// ATR for dynamic stops
+atr = ta.atr(atrLen)
+
+// ========================================
+// 🎨 PLOT INDICATORS
+// ========================================
+
+//if show_ema
+plot(ema_13, "EMA 13", color=color.orange, linewidth=2)
+plot(ema_48, "EMA 48", color=color.purple, linewidth=2)
+plot(ema_200, "EMA 200", color=color.green, linewidth=2)
+
+// ========================================
+// 🔍 TREND DEFINITIONS
+// ========================================
+
+// Strong Trend Definitions (from your script)
+bearTrend = ema_13 < ema_48 and ema_48 < ema_200
+bullTrend = ema_13 > ema_48 and ema_48 > ema_200
+
+// Moderate Trend (EMA 13/48 alignment only)
+bullTrend_moderate = ema_13 > ema_48 and ema_13 > ema_200
+bearTrend_moderate = ema_13 < ema_48 and ema_13 < ema_200
+
+// EMA Direction
+ema13_rising = ema_13 > ema_13[1]
+ema13_falling = ema_13 < ema_13[1]
+
+// Candle Conditions
+redcandle = close < open
+greencandle = close > open
+
+// Price vs EMA
+priceCrossBelow13 = ta.crossunder(close, ema_13)
+priceCrossAbove13 = ta.crossover(close, ema_13)
+priceAbove13 = close > ema_13
+priceBelow13 = close < ema_13
+
+// ========================================
+// 🎯 LONG ENTRY CONDITIONS (BUY CALLS)
+// ========================================
+
+// Your original conditions
+long_cond01 = priceCrossAbove13 and bullTrend and ema13_rising
+//long_cond02 = bullTrend_moderate and redcandle[1] and greencandle and ema13_rising
+long_cond02 = bullTrend_moderate and redcandle[1] and greencandle and ema13_rising
+long_cond03 = bullTrend_moderate and math.abs(open - ema_13) < 0.5 and greencandle and ema13_rising
+
+// Additional MACD conditions
+macd_bull_cross = ta.crossover(macd_line, signal_line)
+macd_bullish = macd_line > signal_line
+macd_hist_increasing = histogram > histogram[1] and histogram > 0
+
+long_macd_filter = use_macd ? (macd_bullish or macd_bull_cross) : true
+
+// Additional RSI conditions
+rsi_long_zone = rsi > 45 and rsi < rsi_overbought
+rsi_recovering = rsi > rsi[1] and rsi > 40
+
+long_rsi_filter = use_rsi ? (rsi_long_zone or rsi_recovering) : true
+
+// Combined long entry
+enterLong = inTradingSession and 
+     (long_cond01 or long_cond02 or long_cond03) and 
+     long_macd_filter and 
+     long_rsi_filter and
+     strategy.position_size == 0
+
+// ========================================
+// 🎯 SHORT ENTRY CONDITIONS (BUY PUTS)
+// ========================================
+
+// Your original conditions
+short_cond01 = priceCrossBelow13 and bearTrend and ema13_falling
+short_cond02 = bearTrend_moderate and greencandle[1] and redcandle and ema13_falling
+short_cond03 = bearTrend_moderate and math.abs(close - ema_13) < 0.5 and redcandle and ema13_falling
+
+// Additional MACD conditions
+macd_bear_cross = ta.crossunder(macd_line, signal_line)
+macd_bearish = macd_line < signal_line
+macd_hist_decreasing = histogram < histogram[1] and histogram < 0
+
+short_macd_filter = use_macd ? (macd_bearish or macd_bear_cross) : true
+
+// Additional RSI conditions
+rsi_short_zone = rsi < 55 and rsi > rsi_oversold
+rsi_weakening = rsi < rsi[1] and rsi < 60
+
+short_rsi_filter = use_rsi ? (rsi_short_zone or rsi_weakening) : true
+
+// Combined short entry
+enterShort = inTradingSession and 
+     (short_cond01 or short_cond02 or short_cond03) and 
+     short_macd_filter and 
+     short_rsi_filter and
+     strategy.position_size == 0
+
+// ========================================
+// 💰 RISK MANAGEMENT
+// ========================================
+
+// ATR-based stops (from your script)
+stopDist = atr * atrSL * 100
+targetDist = atr * atrTP * 100
+
+trailActivationLong = close - stopDist
+trailActivationShort = close + stopDist
+
+// ========================================
+// 🚀 STRATEGY EXECUTION
+// ========================================
+
+// Long Entries (CALL OPTIONS)
+if enterLong
+    strategy.entry("Long", strategy.long)
+    strategy.exit("LX", "Long", 
+         stop=close - stopDist, 
+        // limit=close + targetDist,
+         trail_price=useTrail ? trailActivationLong : na, 
+         trail_offset=useTrail ? stopDist : na)
+
+// Additional Smart Long Exits (from your script + enhancements)
+smartExitLong = strategy.position_size > 0 and 
+     (ta.crossunder(close, ema_13 - 0.25) or  // Price breaks below EMA 13
+     ema_13 < ema_48 or                        // Trend reversal
+     (use_macd and macd_bear_cross) or         // MACD reversal
+     (use_rsi and rsi > rsi_overbought))       // RSI overbought
+
+if smartExitLong
+    strategy.close("Long", comment="Smart Exit")
+
+// Short Entries (PUT OPTIONS)
+if enterShort
+    strategy.entry("Short", strategy.short)
+    strategy.exit("SX", "Short", 
+         stop=close + stopDist, 
+         //limit=close - targetDist,
+         trail_price=useTrail ? trailActivationShort : na, 
+         trail_offset=useTrail ? stopDist : na)
+
+// Additional Smart Short Exits (from your script + enhancements)
+smartExitShort = strategy.position_size < 0 and 
+     (ta.crossover(close, ema_13 + 0.25) or   // Price breaks above EMA 13
+     ema_13 > ema_48 or                        // Trend reversal
+     (use_macd and macd_bull_cross) or         // MACD reversal
+     (use_rsi and rsi < rsi_oversold))         // RSI oversold
+
+if smartExitShort
+    strategy.close("Short", comment="Smart Exit")
+
+// End of Day Flat (from your script)
+eod = time >= timestamp(syminfo.timezone, year, month, dayofmonth, eod_close_time, eod_close_minute)
+if eod and strategy.position_size != 0
+    strategy.close_all("EOD")
+
+// ========================================
+// 🎨 VISUAL ENHANCEMENTS
+// ========================================
+
+// Background coloring for trend
+bgcolor(bullTrend and priceAbove13 ? color.new(color.green, 90) : na)
+bgcolor(bearTrend and priceBelow13 ? color.new(color.red, 90) : na)
+
+// Entry/Exit markers
+longEntry = strategy.position_size > 0 and strategy.position_size[1] <= 0
+shortEntry = strategy.position_size < 0 and strategy.position_size[1] >= 0
+
+longExit = strategy.position_size == 0 and strategy.position_size[1] > 0
+shortExit = strategy.position_size == 0 and strategy.position_size[1] < 0
+
+plotshape(show_labels and longEntry, "Long Entry", 
+     location=location.belowbar, 
+     color=color.new(color.green, 20), 
+     style=shape.labelup, 
+     text="CALL", 
+     textcolor=color.white, 
+     size=size.small)
+
+plotshape(show_labels and shortEntry, "Short Entry", 
+     location=location.abovebar, 
+     color=color.new(color.red, 20), 
+     style=shape.labeldown, 
+     text="PUT", 
+     textcolor=color.white, 
+     size=size.small)
+
+// ========================================
+// 📊 INFO TABLE
+// ========================================
+
+if show_info_table
+    var table info_table = table.new(position.top_right, 2, 12, 
+         border_width=2,
+         border_color=color.gray,
+         frame_width=1,
+         frame_color=color.gray)
+    
+    // Determine current setup
+    current_signal = "HOLD ⏸️"
+    signal_color = color.gray
+    
+    if enterLong
+        current_signal := "BUY CALL 📈"
+        signal_color := color.green
+    else if enterShort
+        current_signal := "BUY PUT 📉"
+        signal_color := color.red
+    else if bullTrend and priceAbove13
+        current_signal := "BULLISH ↗"
+        signal_color := color.new(color.green, 50)
+    else if bearTrend and priceBelow13
+        current_signal := "BEARISH ↘"
+        signal_color := color.new(color.red, 50)
+    
+    // Calculate score
+    bull_score = 0
+    bear_score = 0
+    
+    // Scoring logic
+    if bullTrend
+        bull_score += 30
+    if priceAbove13
+        bull_score += 20
+    if macd_line > signal_line
+        bull_score += 20
+    if rsi > 50 and rsi < 70
+        bull_score += 20
+    if ema13_rising
+        bull_score += 10
+    
+    if bearTrend
+        bear_score += 30
+    if priceBelow13
+        bear_score += 20
+    if macd_line < signal_line
+        bear_score += 20
+    if rsi < 50 and rsi > 30
+        bear_score += 20
+    if ema13_falling
+        bear_score += 10
+    
+    // Header
+    table.cell(info_table, 0, 0, "STRATEGY",text_color=color.white,bgcolor=color.new(color.blue, 20),text_size=size.normal,text_halign=text.align_center)
+    table.cell(info_table, 1, 0, "MASTER",text_color=color.white,bgcolor=color.new(color.blue, 20),text_size=size.normal,text_halign=text.align_center)
+    
+    // Current Signal
+    table.cell(info_table, 0, 1, "Signal", text_color=color.white, bgcolor=color.new(color.gray, 70))
+    table.cell(info_table, 1, 1, current_signal, text_color=color.white, bgcolor=color.new(signal_color, 30), text_size=size.normal)
+    
+    // Position
+    pos_text = strategy.position_size > 0 ? "LONG" : strategy.position_size < 0 ? "SHORT" : "FLAT"
+    pos_color = strategy.position_size > 0 ? color.green : strategy.position_size < 0 ? color.red : color.gray
+    table.cell(info_table, 0, 2, "Position", text_color=color.white, bgcolor=color.new(color.gray, 70))
+    table.cell(info_table, 1, 2, pos_text, text_color=pos_color, bgcolor=color.new(color.gray, 70))
+    
+    // Bull/Bear Score
+    table.cell(info_table, 0, 3, "Bull Score", text_color=color.white, bgcolor=color.new(color.gray, 70))
+    table.cell(info_table, 1, 3, str.tostring(bull_score) + "%", text_color=color.green, bgcolor=color.new(color.gray, 70))
+    
+    table.cell(info_table, 0, 4, "Bear Score", text_color=color.white, bgcolor=color.new(color.gray, 70))
+    table.cell(info_table, 1, 4, str.tostring(bear_score) + "%", text_color=color.red, bgcolor=color.new(color.gray, 70))
+    
+    // Price
+    table.cell(info_table, 0, 5, "Price", text_color=color.white, bgcolor=color.new(color.gray, 70))
+    table.cell(info_table, 1, 5, str.tostring(close, "#.##"), text_color=color.white, bgcolor=color.new(color.gray, 70))
+    
+    // EMAs
+    table.cell(info_table, 0, 6, "EMA 13", text_color=color.white, bgcolor=color.new(color.gray, 70))
+    table.cell(info_table, 1, 6, str.tostring(ema_13, "#.##"), text_color=color.orange, bgcolor=color.new(color.gray, 70))
+    
+    table.cell(info_table, 0, 7, "EMA 48", text_color=color.white, bgcolor=color.new(color.gray, 70))
+    table.cell(info_table, 1, 7, str.tostring(ema_48, "#.##"), text_color=color.purple, bgcolor=color.new(color.gray, 70))
+    
+    // MACD Status
+    table.cell(info_table, 0, 8, "MACD", text_color=color.white, bgcolor=color.new(color.gray, 70))
+    macd_status = macd_line > signal_line ? "BULL ↑" : "BEAR ↓"
+    macd_color = macd_line > signal_line ? color.green : color.red
+    table.cell(info_table, 1, 8, macd_status, text_color=macd_color, bgcolor=color.new(color.gray, 70))
+    
+    // RSI
+    table.cell(info_table, 0, 9, "RSI", text_color=color.white, bgcolor=color.new(color.gray, 70))
+    rsi_color = rsi > rsi_overbought ? color.red : rsi < rsi_oversold ? color.green : color.yellow
+    table.cell(info_table, 1, 9, str.tostring(rsi, "#.#"), text_color=rsi_color, bgcolor=color.new(color.gray, 70))
+    
+    // ATR (Volatility)
+    table.cell(info_table, 0, 10, "ATR", text_color=color.white, bgcolor=color.new(color.gray, 70))
+    table.cell(info_table, 1, 10, str.tostring(atr, "#.##"), text_color=color.white, bgcolor=color.new(color.gray, 70))
+    
+    // P&L
+    table.cell(info_table, 0, 11, "P&L", text_color=color.white, bgcolor=color.new(color.gray, 70))
+    pnl = strategy.netprofit
+    pnl_color = pnl > 0 ? color.green : pnl < 0 ? color.red : color.gray
+    table.cell(info_table, 1, 11, "$" + str.tostring(pnl, "#.##"), text_color=pnl_color, bgcolor=color.new(color.gray, 70))
+
+// ========================================
+// 🔔 ALERTS
+// ========================================
+
+alertcondition(enterLong, title="Long Entry Signal", message="BUY CALL OPTIONS Price: {{close}} EMA13: {{plot_0}} MACD: Bullish RSI: {{plot_3}}")
+
+alertcondition(enterShort, title="Short Entry Signal", message="BUY PUT OPTIONS Price: {{close}} EMA13: {{plot_0}} MACD: Bearish RSI: {{plot_3}}")
+
+alertcondition(smartExitLong, title="Long Exit Signal",      message="SPY: EXIT LONG - Smart Exit Triggered")
+
+alertcondition(smartExitShort, title="Short Exit Signal",      message="SPY: EXIT SHORT - Smart Exit Triggered")
+
+// ========================================
+// 📝 STRATEGY NOTES
+// ========================================
+
+// COMBINED FEATURES FROM BOTH STRATEGIES:
+//
+// FROM YOUR SCRIPT:
+// ✓ ATR-based dynamic stops and targets
+// ✓ Trailing stop functionality
+// ✓ Pre-market high/low tracking
+// ✓ Previous day high/low levels
+// ✓ Multiple EMA-based entry conditions
+// ✓ Smart exits on EMA reversals
+// ✓ EOD flat position management
+// ✓ Regular trading hours filtering
+//
+// FROM MY ENHANCEMENTS:
+// ✓ MACD confirmation filter
+// ✓ RSI momentum zones
+// ✓ Confidence scoring display
+// ✓ Enhanced info table
+// ✓ Multiple alert conditions
+// ✓ Customizable filters
+//
+// ENTRY TRIGGERS:
+// LONG (Calls):
+//   1. Price crosses above EMA 13 + bullish trend + rising EMA 13
+//   2. Bullish trend + reversal candle + rising EMA 13
+//   3. Price near EMA 13 + green candle + rising EMA 13
+//   + MACD bullish (if enabled)
+//   + RSI in momentum zone (if enabled)
+//
+// SHORT (Puts):
+//   1. Price crosses below EMA 13 + bearish trend + falling EMA 13
+//   2. Bearish trend + reversal candle + falling EMA 13
+//   3. Price near EMA 13 + red candle + falling EMA 13
+//   + MACD bearish (if enabled)
+//   + RSI in bearish zone (if enabled)
+//
+// EXITS:
+//   - ATR-based stop loss
+//   - ATR-based take profit
+//   - Optional trailing stop
+//   - Smart exit on EMA reversal
+//   - Smart exit on MACD reversal
+//   - EOD close at 15:59 ET
+//
+// OPTIMAL TIMEFRAMES: 1min, 2min, 5min for day trading
+// RECOMMENDED: 0-2 DTE SPY options
