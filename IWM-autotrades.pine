@@ -1,0 +1,394 @@
+// This Pine Script™ is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © Team2Trading Strategy — v5.23 (IWM — Runner Optimised for P&L)
+// Iteration history:
+//   v5.18: 12 trades, 66.67% WR, +0.94%
+//   v5.22: 10 trades, 60.00% WR, +0.62%  ← WR ✓, P&L ✗
+// v5.23 — same quality gates as v5.22, fix runner exit to grow P&L:
+//   ① Runner NO longer exits on close < ema13 (micro-pullbacks cut winners too early)
+//   ② Runner exits ONLY on Thesis Break (ema13 < ema48) — full trend reversal
+//   ③ Trailing stop for T2 uses 1.5x ATR offset (wider trail = more room to breathe)
+//   ④ All other v5.22 settings unchanged (PM rule, gap-day, spread, ema200 10-bar, etc.)
+
+//@version=6
+strategy("Team2Trading EMA Strategy v5.23",
+     overlay                 = true,
+     initial_capital         = 10000,
+     default_qty_type        = strategy.percent_of_equity,
+     default_qty_value       = 100,
+     commission_type         = strategy.commission.cash_per_order,
+     commission_value        = 0,
+     slippage                = 0,
+     calc_on_every_tick      = false,
+     process_orders_on_close = false,
+     max_bars_back           = 5000)
+
+// ══════════════════════════════════════════════════════════════
+// INPUTS
+// ══════════════════════════════════════════════════════════════
+grp_date  = "Backtest Date Range"
+useDate   = input.bool(true, "Filter by Date Range", group=grp_date)
+startDate = 1744291800000
+endDate   = 1775851200000
+
+grp_ema    = "EMA Settings"
+emaFastLen = input.int(13,  "Fast EMA",   minval=1, group=grp_ema)
+emaMedLen  = input.int(48,  "Medium EMA", minval=1, group=grp_ema)
+emaSlowLen = input.int(200, "Slow EMA",   minval=1, group=grp_ema)
+
+grp_entry          = "Entry Settings"
+emaPullbackPct     = input.float(0.3, "EMA Pullback Proximity (%)", minval=0.05, step=0.05, group=grp_entry) / 100
+pdLevelBuffer      = input.float(0.5, "PD Level Bounce Zone (%)",   minval=0.05, step=0.05, group=grp_entry) / 100
+useEMAPullback     = input.bool(true, "EMA Pullback Entry (Long)",   group=grp_entry)
+usePDHBreakout     = input.bool(true, "PDH Breakout Entry (Long)",   group=grp_entry)
+usePMHBreakout     = input.bool(true, "PMH Breakout Entry (Long)",   group=grp_entry)
+useFlagBreak       = input.bool(true, "Flag Break Entry (Long)",      group=grp_entry)
+useBreakRetestLong = input.bool(true, "Break & Retest Entry (Long)", group=grp_entry)
+useGapDownShort    = input.bool(true, "Gap-Down Open Short",         group=grp_entry)
+gapDownATRMult     = input.float(0.5, "Gap-Down Min Size (ATR x)",   minval=0.1, step=0.1, group=grp_entry)
+
+grp_risk             = "Risk Management"
+atrLen               = input.int(14,    "ATR Length",               minval=1,   group=grp_risk)
+stopATRMult          = input.float(1.0, "Stop Loss (ATR x)",        minval=0.1, step=0.1, group=grp_risk)
+tgt1ATRMult          = input.float(2.0, "Target 1 (ATR x)",         minval=0.5, step=0.1, group=grp_risk)
+tgt2ATRMult          = input.float(4.0, "Target 2 (ATR x)",         minval=1.0, step=0.1, group=grp_risk)  // raised 3.5→4.0
+trimPct              = input.int(50,    "Trim % at T1", minval=10, maxval=90,   group=grp_risk)
+useEMAExit           = input.bool(false,"EMA13 Trail Exit (OFF — use Thesis Break only)", group=grp_risk)  // ① disabled
+minStopPctEMA        = input.float(0.25,"Min Stop Floor % (EMA)",  minval=0.05, maxval=2.0, step=0.05, group=grp_risk)
+minStopPctStructural = input.float(0.15,"Min Stop Floor % (Break)",minval=0.05, maxval=2.0, step=0.05, group=grp_risk)
+signalWickBuffer     = input.int(1,     "Signal Wick Buffer (ticks)",minval=0, maxval=20, group=grp_risk)
+minRewardRisk        = input.float(1.3, "Min Reward/Risk to T1",   minval=0.5, maxval=5.0, step=0.1, group=grp_risk)
+maxConsecutiveLosses = input.int(3,     "Max Consecutive Losses",  minval=1,   group=grp_risk)
+
+grp_fib      = "Fib Extension TP"
+useFibTP     = input.bool(true,   "Use Fib for Breakout TPs",          group=grp_fib)
+fibT1Level   = input.float(0.786, "Fib T1 Level", minval=0.1, step=0.1,group=grp_fib)
+fibT2Level   = input.float(1.0,   "Fib T2 Level", minval=0.1, step=0.1,group=grp_fib)
+useTrailT2   = input.bool(true,   "Trailing Stop for T2 (at Fib T1)", group=grp_fib)
+trailATRMult = input.float(1.5,   "Trail Offset (ATR x)",              minval=0.1, step=0.1, group=grp_fib)  // ③ wider trail
+
+grp_filter      = "Quality Filters"
+volMult         = input.float(1.5,  "Min Volume (x 20-MA) — All", minval=0.1, step=0.1, group=grp_filter)
+volMultPMH      = input.float(1.5,  "Min Volume (x 20-MA) — PMH", minval=0.1, step=0.1, group=grp_filter)
+useVolFilter    = input.bool(true,  "Require Volume Confirmation", group=grp_filter)
+maxDailyTrades  = input.int(3,      "Max Entries Per Day", minval=1, maxval=10, group=grp_filter)
+minBodyPct      = input.float(50.0, "Min Candle Body % of Range", minval=10.0, maxval=90.0, step=5.0, group=grp_filter)
+ema200SlopeBars = input.int(10,     "EMA200 Rising Lookback (bars)", minval=1, maxval=50, group=grp_filter)
+useSpreadFilter = input.bool(true,  "Require Widening EMA13-48 Spread", group=grp_filter)
+useATRExpansion = input.bool(false, "Require ATR Expansion on Entry Bar", group=grp_filter)
+atrExpMult      = input.float(0.7,  "Entry Bar Min Range (ATR x)", minval=0.3, step=0.1, group=grp_filter)
+useGapDayFilter = input.bool(true,  "Skip Longs on Gap-Down Days (open < PDL)", group=grp_filter)
+useShorts       = input.bool(false, "Enable Short Trades (OFF — IWM long-bias)", group=grp_filter)
+
+grp_time             = "Trading Window"
+useTimeFilter        = input.bool(true, "Enable Session Filter (9:30–15:30 ET)", group=grp_time)
+eodNoEntryMins       = input.int(20,   "EOD No-Entry Window (mins)", minval=5, maxval=120, group=grp_time)
+longOpenWaitMins     = input.int(7,    "Long Entry Wait from Open (mins)", minval=0, maxval=120, group=grp_time)
+blockFridays         = input.bool(true,"Block Friday Entries", group=grp_time)
+restrictMiddayLull   = input.bool(true,"Restrict Midday Trades", group=grp_time)
+middayAvoidStartMins = input.int(90,   "Midday Avoid Start (mins)", minval=30, maxval=240, group=grp_time)
+middayAvoidEndMins   = input.int(210,  "Midday Avoid End (mins)",   minval=60, maxval=300, group=grp_time)
+lateLongStructMins   = input.int(270,  "Late Structural Context (mins)", minval=120, maxval=330, group=grp_time)
+
+// ══════════════════════════════════════════════════════════════
+// INDICATORS
+// ══════════════════════════════════════════════════════════════
+ema13  = ta.ema(close, emaFastLen)
+ema48  = ta.ema(close, emaMedLen)
+ema200 = ta.ema(close, emaSlowLen)
+atr    = ta.atr(atrLen)
+volMA  = ta.sma(volume, 20)
+pdh    = request.security(syminfo.tickerid, "D", high[1], lookahead=barmerge.lookahead_on)
+pdl    = request.security(syminfo.tickerid, "D", low[1],  lookahead=barmerge.lookahead_on)
+
+inDateRange = not useDate or (time >= startDate and time <= endDate)
+
+// ══════════════════════════════════════════════════════════════
+// SESSION
+// ══════════════════════════════════════════════════════════════
+warmupComplete  = bar_index >= emaSlowLen + 20
+inSession       = not na(time(timeframe.period, "0930-1530", "America/New_York"))
+inTimeWindow    = not useTimeFilter or inSession
+prevInSession   = bar_index > 0 ? inSession[1] : false
+sessionFirstBar = inSession and not prevInSession
+
+var int sessionStartBarIdx = na
+if sessionFirstBar
+    sessionStartBarIdx := bar_index
+
+barsIntoSession   = na(sessionStartBarIdx) ? 0 : bar_index - sessionStartBarIdx
+longOpenWaitBars  = math.round(longOpenWaitMins / 2)
+longAfterOpenWait = barsIntoSession >= longOpenWaitBars
+eodBlockBars      = math.round(eodNoEntryMins / 2)
+notNearClose      = barsIntoSession < (180 - eodBlockBars)
+notFriday         = not blockFridays or dayofweek(time, "America/New_York") != dayofweek.friday
+middayStartBars   = math.round(middayAvoidStartMins / 2)
+middayEndBars     = math.round(middayAvoidEndMins / 2)
+middayLull        = barsIntoSession >= middayStartBars and barsIntoSession < middayEndBars
+lateStructBars    = math.round(lateLongStructMins / 2)
+
+// ══════════════════════════════════════════════════════════════
+// DAILY CAP & CIRCUIT BREAKER
+// ══════════════════════════════════════════════════════════════
+var int dailyTradeCount   = 0
+var int consecutiveLosses = 0
+var int lastDay           = 0
+currentDay = year(time,"America/New_York")*10000 + month(time,"America/New_York")*100 + dayofmonth(time,"America/New_York")
+if currentDay != lastDay
+    dailyTradeCount   := 0
+    consecutiveLosses := 0
+    lastDay           := currentDay
+closedN = strategy.closedtrades
+if closedN > nz(closedN[1])
+    consecutiveLosses := strategy.closedtrades.profit(closedN - 1) < 0 ? consecutiveLosses + 1 : 0
+
+// ══════════════════════════════════════════════════════════════
+// GAP-DOWN DAY FILTER
+// ══════════════════════════════════════════════════════════════
+var bool skipLongsToday = false
+if sessionFirstBar
+    skipLongsToday := useGapDayFilter and (not na(pdl)) and (open < pdl)
+noGapDownDay = not skipLongsToday
+
+// ══════════════════════════════════════════════════════════════
+// PRE-MARKET HIGH / LOW
+// ══════════════════════════════════════════════════════════════
+preMarketBar = not na(time(timeframe.period, "0400-0929", "America/New_York"))
+var float _pmhBuild = na
+var float _pmlBuild = na
+var int   _pmDay    = 0
+var float pmh       = na
+var float pml       = na
+if currentDay != _pmDay
+    _pmhBuild := na
+    _pmlBuild := na
+    _pmDay    := currentDay
+if preMarketBar
+    _pmhBuild := na(_pmhBuild) ? high : math.max(_pmhBuild, high)
+    _pmlBuild := na(_pmlBuild) ? low  : math.min(_pmlBuild, low)
+if sessionFirstBar and not na(_pmhBuild)
+    pmh := _pmhBuild
+    pml := _pmlBuild
+
+canTrade = dailyTradeCount < maxDailyTrades and consecutiveLosses < maxConsecutiveLosses
+
+// ══════════════════════════════════════════════════════════════
+// PM RANGE GATE — no trades between PM levels
+// unless bounce/reject from PDH or PDL (±0.5%)
+// ══════════════════════════════════════════════════════════════
+inPMRange = not na(pmh) and not na(pml) and close >= pml and close <= pmh
+nearPDH   = not na(pdh) and (math.abs(close - pdh) / pdh) <= pdLevelBuffer
+nearPDL   = not na(pdl) and (math.abs(close - pdl) / pdl) <= pdLevelBuffer
+atPDLevel = nearPDH or nearPDL
+pmRangeOK = not inPMRange or atPDLevel
+
+// ══════════════════════════════════════════════════════════════
+// EMA CONDITIONS
+// ══════════════════════════════════════════════════════════════
+ema13Rising  = ema13 > ema13[3]
+ema48Falling = ema48 < ema48[3]
+ema200Rising = warmupComplete and (ema200 > ema200[ema200SlopeBars])
+bullishEMA   = ema13 > ema48 and ema48 > ema200 and ema200Rising
+bearishBias  = ema13 < ema48 and ema48Falling
+bearishEMA   = ema13 < ema48 and ema48 < ema200
+ema13Falling = ema13 < ema13[3]
+
+emaSpreadNow   = ema13 - ema48
+emaSpreadPrev  = ema13[3] - ema48[3]
+spreadWidening = not useSpreadFilter or (emaSpreadNow > emaSpreadPrev)
+
+longStructCtx       = close > pdh or (not na(pmh) and close > pmh)
+strongTrendLong     = bullishEMA and emaSpreadNow > emaSpreadNow[1]
+middayExcLong       = strongTrendLong and longStructCtx
+middayOKLong        = not restrictMiddayLull or not middayLull or middayExcLong
+middayOKEMAPullback = not restrictMiddayLull or not middayLull
+lateLongOK          = barsIntoSession < lateStructBars or longStructCtx
+
+greenCandle = close > open
+redCandle   = close < open
+candleBody  = math.abs(close - open)
+candleRange = high - low
+strongBody  = candleRange > 0 and (candleBody / candleRange) >= (minBodyPct / 100)
+volOK       = not useVolFilter or (volume > volMA * volMult)
+volOKpmh    = not useVolFilter or (volume > volMA * volMultPMH)
+atrOK       = not useATRExpansion or (candleRange >= atr * atrExpMult)
+hasSize     = candleRange >= close * 0.0003
+
+// ══════════════════════════════════════════════════════════════
+// ENTRY SIGNALS
+// ══════════════════════════════════════════════════════════════
+baseCondLong = warmupComplete and inTimeWindow and inDateRange and canTrade and volOK and hasSize and atrOK and notNearClose and notFriday and noGapDownDay and pmRangeOK
+
+emaPullbackLong = useEMAPullback and baseCondLong and bullishEMA and
+     middayOKEMAPullback and longAfterOpenWait and lateLongOK and spreadWidening and
+     low <= ema13 * (1 + emaPullbackPct) and low > ema48 and
+     greenCandle and strongBody and close > ema13 and ema13Rising
+
+pdhBreakoutLong = usePDHBreakout and baseCondLong and bullishEMA and
+     longAfterOpenWait and lateLongOK and spreadWidening and
+     close > pdh and close[1] <= pdh and
+     greenCandle and strongBody and volume > volMA
+
+baseCondPMH     = warmupComplete and inTimeWindow and inDateRange and canTrade and volOKpmh and hasSize and atrOK and notFriday and noGapDownDay
+pmhBreakoutLong = usePMHBreakout and baseCondPMH and bullishEMA and ema13Rising and
+     spreadWidening and longAfterOpenWait and middayOKLong and lateLongOK and
+     not na(pmh) and close > pmh and close[1] <= pmh and
+     greenCandle and strongBody
+
+flagHigh      = ta.highest(high[1], 5)
+flagLow       = ta.lowest(low[1],  5)
+flagRange     = flagHigh - flagLow
+flagBreakLong = useFlagBreak and baseCondLong and bullishEMA and
+     middayOKLong and longAfterOpenWait and lateLongOK and spreadWidening and
+     flagRange < atr * 1.5 and close > flagHigh and greenCandle and strongBody
+
+pdhBreakoutBars = ta.barssince(close > pdh and close[1] <= pdh)
+pmhBreakoutBars = ta.barssince(not na(pmh) and close > pmh and close[1] <= pmh)
+validPDHRetest  = pdhBreakoutBars > 0 and pdhBreakoutBars <= 30 and low <= pdh + (atr * 0.5) and low >= pdh - (atr * 0.2)
+validPMHRetest  = pmhBreakoutBars > 0 and pmhBreakoutBars <= 30 and low <= pmh + (atr * 0.5) and low >= pmh - (atr * 0.2)
+retestLevel     = validPDHRetest ? pdh : pmh
+breakRetestLong = useBreakRetestLong and baseCondLong and bullishEMA and
+     middayOKLong and longAfterOpenWait and lateLongOK and spreadWidening and
+     (validPDHRetest or validPMHRetest) and greenCandle and strongBody and close > retestLevel
+
+gapDownOpenShort = useGapDownShort and useShorts and warmupComplete and inTimeWindow and
+     inDateRange and canTrade and notFriday and sessionFirstBar and
+     open < pdl - atr * gapDownATRMult and redCandle and strongBody
+
+// ══════════════════════════════════════════════════════════════
+// REWARD / RISK GATE
+// ══════════════════════════════════════════════════════════════
+longSignal  = emaPullbackLong or pdhBreakoutLong or pmhBreakoutLong or flagBreakLong or breakRetestLong
+shortSignal = gapDownOpenShort
+
+longIsEMA    = emaPullbackLong
+longMinStop  = longIsEMA ? minStopPctEMA : minStopPctStructural
+longWickBuf  = syminfo.mintick * signalWickBuffer
+longWickDist = math.max(close - (low - longWickBuf), syminfo.mintick)
+longPctDist  = close * (longMinStop / 100)
+longStopDist = math.max(atr * stopATRMult, longPctDist, longWickDist)
+longPmRange  = not na(pmh) and not na(pml) ? pmh - pml : atr * 3.0
+longIsFib    = useFibTP and (pmhBreakoutLong or pdhBreakoutLong) and longPmRange > 0
+longTgt1     = longIsFib ? pmh + longPmRange * fibT1Level : close + atr * tgt1ATRMult
+longRR       = longStopDist > 0 ? (longTgt1 - close) / longStopDist : 0.0
+longEntryReady = longSignal and longRR >= minRewardRisk
+
+shortStopDist   = math.max(atr * stopATRMult, close * (minStopPctStructural / 100))
+shortTgt1       = close - atr * tgt1ATRMult
+shortRR         = shortStopDist > 0 ? (close - shortTgt1) / shortStopDist : 0.0
+shortEntryReady = shortSignal and shortRR >= minRewardRisk
+
+// ══════════════════════════════════════════════════════════════
+// STRATEGY EXECUTION
+// ══════════════════════════════════════════════════════════════
+atmStrike    = str.tostring(math.round(close))
+entryLongMsg = '{"action":"buy","ticker":"'  + syminfo.ticker + '","type":"call","strike":' + atmStrike + ',"dte":0,"qty":1}'
+exitMsg      = '{"action":"sell","ticker":"' + syminfo.ticker + '"}'
+
+var string entryType = ""
+
+if longEntryReady and strategy.position_size == 0
+    stopPx  = close - longStopDist
+    isFib   = longIsFib
+    tgt1Px  = longTgt1
+    tgt2Px  = isFib ? pmh + longPmRange * fibT2Level : close + atr * tgt2ATRMult
+    trailTk = math.round(atr * trailATRMult / syminfo.mintick)
+    entryType := emaPullbackLong ? "EMA Pull" : pdhBreakoutLong ? "PDH Break" : pmhBreakoutLong ? "PMH Break" : flagBreakLong ? "Flag Break" : "Brk/Retest"
+    strategy.entry("Long", strategy.long, comment=entryType, alert_message=entryLongMsg)
+    strategy.exit("T1", "Long", qty_percent=trimPct, limit=tgt1Px, stop=stopPx, alert_message=exitMsg)
+    if isFib and useTrailT2
+        strategy.exit("T2", "Long", trail_price=tgt1Px, trail_offset=trailTk, stop=stopPx, alert_message=exitMsg)
+    else
+        strategy.exit("T2", "Long", limit=tgt2Px, stop=stopPx, alert_message=exitMsg)
+    dailyTradeCount += 1
+
+if shortEntryReady and strategy.position_size == 0
+    stopPx  = close + shortStopDist
+    tgt2Px  = close - atr * tgt2ATRMult
+    trailTk = math.round(atr * trailATRMult / syminfo.mintick)
+    entryType := "Gap-Down"
+    strategy.entry("Short", strategy.short, comment=entryType, alert_message=exitMsg)
+    strategy.exit("T1", "Short", qty_percent=trimPct, limit=shortTgt1, stop=stopPx, alert_message=exitMsg)
+    strategy.exit("T2", "Short", limit=tgt2Px, stop=stopPx, alert_message=exitMsg)
+    dailyTradeCount += 1
+
+// ══════════════════════════════════════════════════════════════
+// RUNNER EXITS ① ② — thesis break only (no ema13 micro-trail)
+// ══════════════════════════════════════════════════════════════
+var float startPosSize = 0.0
+if strategy.position_size != 0 and strategy.position_size[1] == 0
+    startPosSize := math.abs(strategy.position_size)
+inRunnerLong  = strategy.position_size > 0 and math.abs(strategy.position_size) < startPosSize
+inRunnerShort = strategy.position_size < 0 and math.abs(strategy.position_size) < startPosSize
+
+// EMA13 trail only active if useEMAExit = true (default OFF in v5.23)
+if useEMAExit and inRunnerLong  and close < ema13
+    strategy.close("Long",  comment="EMA Trail", alert_message=exitMsg)
+if useEMAExit and inRunnerShort and close > ema13
+    strategy.close("Short", comment="EMA Trail", alert_message=exitMsg)
+// Thesis Break fires when the trend fully reverses (ema13 crosses below ema48)
+if inRunnerLong  and ema13 < ema48
+    strategy.close("Long",  comment="Thesis Break", alert_message=exitMsg)
+if inRunnerShort and ema13 > ema48
+    strategy.close("Short", comment="Thesis Break", alert_message=exitMsg)
+
+sessionClose = not inSession and prevInSession
+if sessionClose and strategy.position_size != 0
+    strategy.close_all("EOD", alert_message=exitMsg)
+
+// ══════════════════════════════════════════════════════════════
+// PLOTTING
+// ══════════════════════════════════════════════════════════════
+plot(ema13,  "13 EMA",  color=color.yellow, linewidth=2)
+plot(ema48,  "48 EMA",  color=color.purple, linewidth=2)
+plot(ema200, "200 EMA", color=color.red,    linewidth=2)
+plot(pdh, "PDH", color=color.new(color.lime,   50), style=plot.style_stepline, linewidth=1)
+plot(pdl, "PDL", color=color.new(color.red,    50), style=plot.style_stepline, linewidth=1)
+plot(pmh, "PMH", color=color.new(color.aqua,   60), style=plot.style_stepline, linewidth=1)
+plot(pml, "PML", color=color.new(color.orange,  60), style=plot.style_stepline, linewidth=1)
+
+bgcolor(bullishEMA  ? color.new(color.green,  93) :
+        bearishEMA  ? color.new(color.red,    90) :
+        bearishBias ? color.new(color.orange, 95) : na)
+plotshape(longEntryReady  and strategy.position_size == 0, "Long",  shape.triangleup,   location.belowbar, color.lime, size=size.small)
+plotshape(shortEntryReady and strategy.position_size == 0, "Short", shape.triangledown, location.abovebar, color.red,  size=size.small)
+sessionOpen = inSession and not prevInSession
+bgcolor(sessionOpen  ? color.new(color.teal,   70) : na, offset=-1)
+bgcolor(sessionClose ? color.new(color.orange, 70) : na, offset=-1)
+
+// ══════════════════════════════════════════════════════════════
+// INFO TABLE
+// ══════════════════════════════════════════════════════════════
+var table tbl = table.new(position.top_right, 2, 14, bgcolor=color.new(color.black,80), border_width=1)
+if barstate.islast
+    table.cell(tbl, 0, 0, "Team2Trading",   text_color=color.white,  text_size=size.normal, bgcolor=color.new(#1B2A4A,0))
+    table.cell(tbl, 1, 0, "v5.23",          text_color=color.yellow, text_size=size.normal, bgcolor=color.new(#1B2A4A,0))
+    table.cell(tbl, 0, 1, "EMA Stack", text_color=color.gray, text_size=size.small)
+    trendTxt = bullishEMA ? "BULL ▲" : bearishEMA ? "BEAR ▼" : bearishBias ? "INTRA ▼" : "NEUTRAL"
+    trendClr = bullishEMA ? color.green : bearishBias ? color.red : color.gray
+    table.cell(tbl, 1, 1, trendTxt, text_color=trendClr, text_size=size.small)
+    table.cell(tbl, 0, 2, "Spread",   text_color=color.gray, text_size=size.small)
+    table.cell(tbl, 1, 2, spreadWidening ? "Wide ✓" : "Flat ✗", text_color=spreadWidening ? color.green : color.red, text_size=size.small)
+    table.cell(tbl, 0, 3, "PM Zone",  text_color=color.gray, text_size=size.small)
+    pmZoneTxt = inPMRange ? (atPDLevel ? "PD Bounce ✓" : "BLOCKED ✗") : "Outside ✓"
+    pmZoneClr = inPMRange ? (atPDLevel ? color.green : color.red) : color.green
+    table.cell(tbl, 1, 3, pmZoneTxt, text_color=pmZoneClr, text_size=size.small)
+    table.cell(tbl, 0, 4, "Gap Day",  text_color=color.gray, text_size=size.small)
+    table.cell(tbl, 1, 4, skipLongsToday ? "SKIP ✗" : "OK ✓", text_color=skipLongsToday ? color.red : color.green, text_size=size.small)
+    table.cell(tbl, 0, 5, "13 EMA",  text_color=color.yellow, text_size=size.small)
+    table.cell(tbl, 1, 5, str.tostring(ema13,  "#.##"), text_color=color.white, text_size=size.small)
+    table.cell(tbl, 0, 6, "48 EMA",  text_color=color.purple, text_size=size.small)
+    table.cell(tbl, 1, 6, str.tostring(ema48,  "#.##"), text_color=color.white, text_size=size.small)
+    table.cell(tbl, 0, 7, "200 EMA", text_color=color.red,    text_size=size.small)
+    table.cell(tbl, 1, 7, str.tostring(ema200, "#.##"), text_color=color.white, text_size=size.small)
+    table.cell(tbl, 0, 8, "ATR",     text_color=color.gray,   text_size=size.small)
+    table.cell(tbl, 1, 8, str.tostring(atr,   "#.##"),  text_color=color.white, text_size=size.small)
+    table.cell(tbl, 0, 9, "PDH",     text_color=color.lime,   text_size=size.small)
+    table.cell(tbl, 1, 9, str.tostring(pdh,   "#.##"),  text_color=color.white, text_size=size.small)
+    table.cell(tbl, 0,10, "PDL",     text_color=color.red,    text_size=size.small)
+    table.cell(tbl, 1,10, str.tostring(pdl,   "#.##"),  text_color=color.white, text_size=size.small)
+    table.cell(tbl, 0,11, "PMH",     text_color=color.aqua,   text_size=size.small)
+    table.cell(tbl, 1,11, str.tostring(pmh,   "#.##"),  text_color=color.white, text_size=size.small)
+    table.cell(tbl, 0,12, "Session", text_color=color.gray,   text_size=size.small)
+    table.cell(tbl, 1,12, inSession ? "OPEN ✓" : "CLOSED ✗", text_color=inSession ? color.green : color.red, text_size=size.small)
+    table.cell(tbl, 0,13, "Trades",  text_color=color.gray,   text_size=size.small)
+    table.cell(tbl, 1,13, str.tostring(dailyTradeCount)+"/"+str.tostring(maxDailyTrades)+" str:"+str.tostring(consecutiveLosses), text_color=(dailyTradeCount>=maxDailyTrades or consecutiveLosses>=maxConsecutiveLosses) ? color.red : color.green, text_size=size.small)
