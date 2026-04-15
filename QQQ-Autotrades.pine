@@ -70,6 +70,8 @@ maxDailyTrades = input.int(2,     "Max Entries Per Day", minval=1, maxval=10, gr
 minBodyPct     = input.float(50.0, "Min Candle Body % of Range", minval=20.0, maxval=90.0, step=5.0, group=grp_filter) // 50% on 2-min vs 40% on 5-min
 ema200SlopeBars = input.int(5, "EMA200 Rising Lookback (bars)", minval=1, maxval=50, group=grp_filter) // 5 bars = 10 min on 2-min chart
 requireFullBearStack = input.bool(true, "Require Full Bear Stack for Shorts", group=grp_filter)
+minBarSizePctEMA        = input.float(0.05, "Min Bar Size % — EMA entries",        minval=0.01, step=0.01, group=grp_filter) / 100
+minBarSizePctStructural = input.float(0.03, "Min Bar Size % — Structural entries", minval=0.01, step=0.01, group=grp_filter) / 100
 
 grp_time = "Trading Window"
 useTimeFilter      = input.bool(true, "Enable Session Filter (9:30–15:30 ET)", group=grp_time)
@@ -77,7 +79,7 @@ useTimeFilter      = input.bool(true, "Enable Session Filter (9:30–15:30 ET)",
 eodNoEntryMins     = input.int(60,  "EOD No-Entry Window (mins before close)", minval=5,  maxval=120, group=grp_time)
 // Fix 2: EMA13/48 rejection shorts blocked in first N minutes of session (peak-loss early window).
 emaRejBlackoutMins = input.int(60,  "EMA Rejection Blackout from Open (mins)", minval=0,  maxval=120, group=grp_time)
-longOpenWaitMins   = input.int(20,  "Long Entry Wait from Open (mins)", minval=0, maxval=120, group=grp_time)
+longOpenWaitMins   = input.int(10,  "Long Entry Wait from Open (mins)", minval=0, maxval=120, group=grp_time)
 // Fix A (v5.4): Block all entries on Fridays — 0 winners from 11 entries in 365-day backtest.
 blockFridays       = input.bool(true, "Block Friday Entries (0% WR in backtest)", group=grp_time)
 restrictMiddayLull = input.bool(true, "Restrict Midday Trades (Longs)", group=grp_time)
@@ -242,12 +244,16 @@ candleRange = high - low
 strongBody  = candleRange > 0 and (candleBody / candleRange) >= (minBodyPct / 100)
 
 // Volume filter
-volOK = not useVolFilter or (volume > volMA * volMult)
+volOK           = not useVolFilter or (volume > volMA * volMult)          // 1.5x — EMA bounce/rejection entries
+volOKStructural = not useVolFilter or (volume > volMA)                    // 1.0x — PDH/PDL breakout bars often compress at key levels
 
-// Minimum bar size filter: skip micro-bars where range < 0.05% of price
-// (on 2-min charts these are common and generate false signals)
-minBarSize = close * 0.0005
-hasSize    = candleRange >= minBarSize
+// Minimum bar size filter: split by entry type.
+// EMA entries (0.05%): decisive bounce/rejection bars should have real range.
+// Structural entries (0.03%): PDH/PMH breakout bars often compress at key levels before breaking.
+minBarSizeEMA        = close * minBarSizePctEMA
+minBarSizeStructural = close * minBarSizePctStructural
+hasSizeEMA        = candleRange >= minBarSizeEMA
+hasSizeStructural = candleRange >= minBarSizeStructural
 
 // ══════════════════════════════════════════════════════════════
 // ENTRY SIGNALS
@@ -259,9 +265,12 @@ hasSize    = candleRange >= minBarSize
 inPMRange    = not na(pmh) and not na(pml) and close >= pml and close <= pmh
 notInPMRange = na(pmh) or na(pml) or not inPMRange
 
-// Guard all signals with warmupComplete + hasSize to prevent reload inconsistency and micro-bar noise
-baseCondLong  = warmupComplete and inTimeWindow and canTrade and volOK and hasSize and notInPMRange and notNearClose and notFriday
-baseCondShort = warmupComplete and inTimeWindow and canTrade and volOK and hasSize and notInPMRange and notNearClose and notFriday
+// EMA-based entries use hasSizeEMA (0.05%); structural breakout entries use hasSizeStructural (0.03%)
+baseCondLong  = warmupComplete and inTimeWindow and canTrade and volOK and hasSizeEMA        and notInPMRange and notNearClose and notFriday
+baseCondShort = warmupComplete and inTimeWindow and canTrade and volOK and hasSizeEMA        and notInPMRange and notNearClose and notFriday
+// Structural entries bypass PM Range filter (they target the range boundaries) and use looser size + volume thresholds
+baseCondStructuralLong  = warmupComplete and inTimeWindow and canTrade and volOKStructural and hasSizeStructural and notNearClose and notFriday
+baseCondStructuralShort = warmupComplete and inTimeWindow and canTrade and volOKStructural and hasSizeStructural and notNearClose and notFriday
 
 // === LONG SIGNALS ===
 
@@ -276,7 +285,7 @@ emaPullbackLong = useEMAPullback and baseCondLong and bullishEMA and middayOKEMA
 
 // 2. PDH Breakout: first bar to close above prior-day high.
 //    Only requires intraday momentum (ema13 > ema48) — not full bull stack.
-pdhBreakoutLong = usePDHBreakout and baseCondLong and (ema13 > ema48) and longAfterOpenWait and lateLongOK and
+pdhBreakoutLong = usePDHBreakout and baseCondStructuralLong and (ema13 > ema48) and longAfterOpenWait and lateLongOK and
      close > pdh and close[1] <= pdh and
      greenCandle and strongBody and volume > volMA
 
@@ -285,7 +294,7 @@ pdhBreakoutLong = usePDHBreakout and baseCondLong and (ema13 > ema48) and longAf
 //    Uses ema13Rising (not ema13>ema48) — on crash-recovery days EMAs re-cross AFTER the break.
 //    Uses its own softer volume threshold (volMultPMH) — PMH reclaims often occur on quieter volume.
 volOKpmh        = not useVolFilter or (volume > volMA * volMultPMH)
-baseCondPMH     = warmupComplete and inTimeWindow and canTrade and volOKpmh and hasSize and notInPMRange and notFriday
+baseCondPMH     = warmupComplete and inTimeWindow and canTrade and volOKpmh and hasSizeStructural and notInPMRange and notFriday
 pmhBreakoutLong = usePMHBreakout and baseCondPMH and ema13Rising and longAfterOpenWait and middayOKLong and lateLongOK and
      not na(pmh) and
      close > pmh and close[1] <= pmh and
@@ -307,7 +316,7 @@ pmhBreakoutBars = ta.barssince(not na(pmh) and close > pmh and close[1] <= pmh)
 validPDHRetestLong = pdhBreakoutBars > 0 and pdhBreakoutBars <= 30 and low <= pdh + (atr * 0.5) and low >= pdh - (atr * 0.2)
 validPMHRetestLong = pmhBreakoutBars > 0 and pmhBreakoutBars <= 30 and low <= pmh + (atr * 0.5) and low >= pmh - (atr * 0.2)
 
-breakRetestLong = useBreakRetestLong and baseCondLong and bullishEMA and middayOKLong and longAfterOpenWait and lateLongOK and
+breakRetestLong = useBreakRetestLong and baseCondStructuralLong and bullishEMA and middayOKLong and longAfterOpenWait and lateLongOK and
      (validPDHRetestLong or validPMHRetestLong) and
      greenCandle and strongBody and
      close > math.max((validPDHRetestLong ? pdh : 0), (validPMHRetestLong ? pmh : 0))
@@ -326,7 +335,7 @@ emaRejectionShort = useEMARejection and baseCondShort and emaShortTrendReady and
      redCandle and strongBody and close < ema13 and ema13Falling
 
 // 5. PDL Breakdown: first bar to close below prior-day low (or session-open gap below PDL)
-pdlBreakdownShort = usePDLBreakdown and baseCondShort and emaShortTrendReady and middayOKShort and
+pdlBreakdownShort = usePDLBreakdown and baseCondStructuralShort and emaShortTrendReady and middayOKShort and
      close < pdl and (close[1] >= pdl or sessionFirstBar) and
      redCandle and strongBody and volume > volMA
 
@@ -352,7 +361,7 @@ pmlBreakdownBars = ta.barssince(not na(pml) and close < pml and close[1] >= pml)
 validPDLRetestShort = pdlBreakdownBars > 0 and pdlBreakdownBars <= 30 and high >= pdl - (atr * 0.2) and high <= pdl + (atr * 0.5)
 validPMLRetestShort = pmlBreakdownBars > 0 and pmlBreakdownBars <= 30 and high >= pml - (atr * 0.2) and high <= pml + (atr * 0.5)
 
-breakRetestShort = useBreakRetestShort and baseCondShort and emaShortTrendReady and middayOKShort and
+breakRetestShort = useBreakRetestShort and baseCondStructuralShort and emaShortTrendReady and middayOKShort and
      (validPDLRetestShort or validPMLRetestShort) and
      redCandle and strongBody and
      close < math.min((validPDLRetestShort ? pdl : 999999), (validPMLRetestShort ? pml : 999999))
